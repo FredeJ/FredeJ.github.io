@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta name="generator" content="Pelican" />
+        <title>Network Discovery is a mess</title>
+        <link rel="stylesheet" href="/theme/css/main.css" />
+        <meta name="description" content="The state of network discovery is a mess. In general I'm all for having implementation seperated from definition and having multiple..." />
+</head>
+
+<body id="index" class="home">
+        <header id="banner" class="body">
+                <h1><a href="/">Frederiks Blog</a></h1>
+                <nav><ul>
+                    <li><a href="/category/misc.html">misc</a></li>
+                </ul></nav>
+        </header><!-- /#banner -->
+<section id="content" class="body">
+  <article>
+    <header>
+      <h1 class="entry-title">
+        <a href="/drafts/network-discovery-is-a-mess.html" rel="bookmark"
+           title="Permalink to Network Discovery is a mess">Network Discovery is a mess</a></h1>
+    </header>
+
+    <div class="entry-content">
+<footer class="post-info">
+        <abbr class="published" title="2022-08-01T00:00:00+02:00">
+                Published: Mon 01 August 2022
+        </abbr>
+
+        <address class="vcard author">
+                By                         <a class="url fn" href="/author/frederik-juul.html">Frederik Juul</a>
+        </address>
+<p>In <a href="/category/networking.html">Networking</a>.</p>
+
+</footer><!-- /.post-info -->      <p>The state of network discovery is a mess.</p>
+<p>In general I'm all for having implementation seperated from definition and having multiple implementations of standard, things are not great in the Network Discovery world.</p>
+<p>Let's start from the top.</p>
+<p>Multicast Domain Name Service was proposed as an RFC in 2000 by Bill Woodcock and Bill Manning<a href="https://datatracker.ietf.org/doc/html/draft-manning-dnsext-mdns-00.txt">1</a>. This RFC was picked up by Microsoft and Apple and turned into LLMNR and "Bonjour / Rendevouz" respectively. Apples implementation later turned into what's today known as mDNS <a href="https://datatracker.ietf.org/doc/html/rfc6762">2</a> and DNS-SD<a href="https://datatracker.ietf.org/doc/html/rfc6763">3</a>.</p>
+<p>The purpose of the service is achieving what is known as zero configuration networking (zeroconf). This was all the rage back in the day, where a ton of manual work had to be done to properly set up a network. Zeroconf includes DHCP for IPs and DNS for hostnames and service discovery - basically everything we consider ubiqutious for a functioning network today.</p>
+<p>While DHCP and DNS are both massively successful at their primary usecase, the service discovery part has always felt like the ugly duckling. </p>
+<p>Service Discovery on the local network can be broken into two seperate pieces: mDNS and DNS-SD. mDNS is the ability for DNS Records to be distributed over the local network, while DNS SRV Records (Service Records) allows services to be defined and distributed over DNS. Together, they allow services to be discovered on the local network.</p>
+<p>So what's the issue? Well, as I'll demonstrate in this article, the strengths of the solution are unimportant in its most widely used form, while the drawbacks are actively hurting.</p>
+<h1>The mDNS Protocol</h1>
+<p>So, through DNS A Records, we have a way of pairing hostnames to IPs. By introducing mDNS and distributing A records, we have now solved the issue of naming PCs on the local network without relying on a centralized location. Great! This, alongside DHCP takes care of 2/3s of the goals of zeroconf!</p>
+<p>So lets say we have a server with the hostname <code>server</code>. When trying to access <code>server</code>, the domain name must be resolved, as is the case with any domain name. For the regular unicast DNS this involves going to your favourite DNS server and asking for an A Record for the appropriate domain. So far so good.</p>
+<p>For mDNS the situation is a little bit different. As with all DNS Solutions a cache is maintained on your PC. However, if the entry is not in your cache, you multicast over the network "Is anyone here named <code>server</code>?". Now, anyone who has knowledge (in their cache) around who is named <code>server</code> can reply. An implementation optimization ensures that (most likely) only one actually replies. This is done through multicast, so everyone can update their cache with the latest information.</p>
+<p>Now lets take a look at how things look for service discovery.</p>
+<p>A service registers (multicasts) an SRV record looking something like this:</p>
+<div class="highlight"><pre><span></span><code>service protocol domain ttl IN type priority weight port target
+_service._tcp.local.    120 IN SRV  0        10     5000 server.local
+</code></pre></div>
+
+<p>This is cached by everyone who's listening. This tells everyone that a service of type <code>_service._tcp.local</code> can be found at <code>server.local:5000</code>. Additionally, a PTR Record is created with a given instance name like <code>MyHomeServer</code>, which allows naming of specific services.</p>
+<p>Another node comes online and wants to connect to a service of type <code>_service._tcp.local</code>. It multicasts a request to find all services of this type. The same optimization as above happens, resulting in a single response being multicast back, containing the cached services of the type on the network. If a node on the network determines the response to be inaccurate, the node multicasts the contents of its cache. The result is that every node on the network eventually agrees on what services are available on the network.</p>
+<p>As you may notice, the service record contains the hostname rather than the IP. This is good, as the IP might change but the hostname can stay the same. Additionally, this means that there's no duplicate information stored, as the conversion from hostname to IP is handled by an A record. More on this later.</p>
+<p>In addition to SRV Records, we're also able to store additional information on a service using TXT Records. TXT Records can contain anything, but are usually used as key-value stores for extra information. This information can be useful in informing others about the current state of the service (if it's a stateful service) or informing other things such as paths on webservers or similar.</p>
+<h1>The issues</h1>
+<p>Okay, so previously we talked about how SRV Records store hostnames rather than IPs, since the hostname to IP conversion is handled by an A record. I strongly believe this is a bad thing. Let's explore why:</p>
+<p>So first of, honestly, in a good old regular LAN, how often does your IP really change? I fully understand that it theoreticaly could when the DHCP lease is over, but come on.. a DHCP lease is usually like 24 hours, where the regular TTL for a service registration is 120 seconds. And usually what happens with a DHCP lease for a machine is that it's just renewed, with the same IP. In other words, for the common case I believe the extra flexibility is not necessary.</p>
+<p>And we pay for that flexibility. That flexibility costs us two multicasts every time a connection is made to any service, from any PC on the network - one request and one response. But can't we just cache the A Record and avoid it? Yes! But that's equivalent to the SRV record just providing the IP in the first place! And if we cache it, we lose that very same flexibility that we've just paid for!</p>
+<p>Additionally, TXT Records are provided at resolution time, rather than discovery. So that's another two multicasts to get the TXT Record! Luckily, I believe that the TXT Records and A records can be squished together into a single response, but that still means that if I just want to know the state of a stateful service (such as a device) I need to resolve it. In this scenario the number of multicasts scale with the product of the number of services and the number of service-consumers! And again, this information cannot / should not be cached because it is designed around this information changing at any moment, so the response your friend just got may no longer be valid.</p>
+<p>This might all seem trivial, but multicasts are expensive.</p>
+<p>For a WLAN, every time a multicast or broadcast is sent, the entire wireless network slows down. Much like TCP, the protocol used in WLAN is acknowleding messages to improve reliability. With multicast it cannot do that. What happens instead is that it slows down to the very slowest speed it can go and multicasts the message as that has the highest likelyhood of the message being received by everyone. This takes forever by Wi-Fi standards, and this is time where other messages cannot be sent, slowing down the throughput of the entire network.</p>
+<ul>
+<li>Why is it a mess?</li>
+<li>https://datatracker.ietf.org/doc/html/rfc6762</li>
+<li>Attempts to provide full DNS support in a multicast scenario</li>
+<li>Who is it for? Regular users does not require full DNS support. Enterprise users would never use mDNS.</li>
+<li>What's really necessary? Hostnames resolution, service name, type, port, details.</li>
+<li>How does it work?</li>
+<li>Multicast everywhere</li>
+<li>Poor WLAN Performance</li>
+<li>3 multicasts to connect to service</li>
+<li>What different implementations are there?</li>
+<li>Linux<ul>
+<li>Avahi</li>
+</ul>
+</li>
+<li>MacOS / iOS<ul>
+<li>Bonjour</li>
+<li>NWBrowser</li>
+</ul>
+</li>
+<li>Windows<ul>
+<li>Enumeration</li>
+<li>Needlessly convoluted</li>
+<li>Doesn't respect TTL</li>
+<li></li>
+<li>WinDNS</li>
+<li>Bonjour</li>
+</ul>
+</li>
+<li>Libraries<ul>
+<li>Go</li>
+<li>Python</li>
+</ul>
+</li>
+<li>Other protocols</li>
+<li>SSDP</li>
+<li>uPNP</li>
+<li>What's next?
+https://tools.ietf.org/id/draft-ietf-dnssd-srp-00.html</li>
+</ul>
+    </div><!-- /.entry-content -->
+
+  </article>
+</section>
+        <section id="extras" class="body">
+                <div class="social">
+                        <h2>social</h2>
+                        <ul>
+
+                            <li><a href="https://www.linkedin.com/in/frederik-juul-1b296525/">LinkedIn</a></li>
+                            <li><a href="https://github.com/FredeJ">Github</a></li>
+                        </ul>
+                </div><!-- /.social -->
+        </section><!-- /#extras -->
+
+        <footer id="contentinfo" class="body">
+                <address id="about" class="vcard body">
+                Proudly powered by <a href="https://getpelican.com/">Pelican</a>, which takes great advantage of <a href="https://www.python.org/">Python</a>.
+                </address><!-- /#about -->
+
+                <p>The theme is by <a href="https://www.smashingmagazine.com/2009/08/designing-a-html-5-layout-from-scratch/">Smashing Magazine</a>, thanks!</p>
+        </footer><!-- /#contentinfo -->
+
+</body>
+</html>
